@@ -1,6 +1,14 @@
+from __future__ import annotations
+import uuid
 import torch
 import comfy.model_management
 import comfy.conds
+import comfy.hooks
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from comfy.model_patcher import ModelPatcher
+    from comfy.model_base import BaseModel
+    from comfy.controlnet import ControlBase
 
 def prepare_mask(noise_mask, shape, device):
     """ensures noise mask is of proper dimensions"""
@@ -14,8 +22,20 @@ def get_models_from_cond(cond, model_type):
     models = []
     for c in cond:
         if model_type in c:
-            models += [c[model_type]]
+            if isinstance(c[model_type], list):
+                models += c[model_type]
+            else:
+                models += [c[model_type]]
     return models
+
+def get_hooks_from_cond(cond, hooks_dict: dict[comfy.hooks.EnumHookType, dict[comfy.hooks.Hook, None]]):
+    for c in cond:
+        if 'hooks' in c:
+            for hook in c['hooks'].hooks:
+                hook: comfy.hooks.Hook
+                with_type = hooks_dict.setdefault(hook.hook_type, {})
+                with_type[hook] = None
+    return hooks_dict
 
 def convert_cond(cond):
     out = []
@@ -26,17 +46,22 @@ def convert_cond(cond):
             model_conds["c_crossattn"] = comfy.conds.CONDCrossAttn(c[0]) #TODO: remove
             temp["cross_attn"] = c[0]
         temp["model_conds"] = model_conds
+        temp["uuid"] = uuid.uuid4()
         out.append(temp)
     return out
 
 def get_additional_models(conds, dtype):
     """loads additional models in conditioning"""
-    cnets = []
+    cnets: list[ControlBase] = []
     gligen = []
+    add_models = []
+    hooks: dict[comfy.hooks.EnumHookType, dict[comfy.hooks.Hook, None]] = {}
 
     for k in conds:
         cnets += get_models_from_cond(conds[k], "control")
         gligen += get_models_from_cond(conds[k], "gligen")
+        add_models += get_models_from_cond(conds[k], "additional_models")
+        get_hooks_from_cond(conds[k], hooks)
 
     control_nets = set(cnets)
 
@@ -47,7 +72,9 @@ def get_additional_models(conds, dtype):
         inference_memory += m.inference_memory_requirements(dtype)
 
     gligen = [x[1] for x in gligen]
-    models = control_models + gligen
+    hook_models = [x.model for x in hooks.get(comfy.hooks.EnumHookType.AddModels, {}).keys()]
+    models = control_models + gligen + add_models + hook_models
+
     return models, inference_memory
 
 def cleanup_additional_models(models):
@@ -57,10 +84,11 @@ def cleanup_additional_models(models):
             m.cleanup()
 
 
-def prepare_sampling(model, noise_shape, conds):
+def prepare_sampling(model: 'ModelPatcher', noise_shape, conds):
     device = model.load_device
-    real_model = None
+    real_model: 'BaseModel' = None
     models, inference_memory = get_additional_models(conds, model.model_dtype())
+    models += model.get_all_additional_models()  # TODO: does this require inference_memory update?
     memory_required = model.memory_required([noise_shape[0] * 2] + list(noise_shape[1:])) + inference_memory
     minimum_memory_required = model.memory_required([noise_shape[0]] + list(noise_shape[1:])) + inference_memory
     comfy.model_management.load_models_gpu([model] + models, memory_required=memory_required, minimum_memory_required=minimum_memory_required)
@@ -76,3 +104,10 @@ def cleanup_models(conds, models):
         control_cleanup += get_models_from_cond(conds[k], "control")
 
     cleanup_additional_models(set(control_cleanup))
+
+def prepare_model_patcher(model: 'ModelPatcher', conds):
+    # check for hooks in conds - if not registered, see if can be applied
+    hooks = {}
+    for k in conds:
+        get_hooks_from_cond(conds[k], hooks)
+    model.register_all_hook_patches(hooks, comfy.hooks.EnumWeightTarget.Model)
